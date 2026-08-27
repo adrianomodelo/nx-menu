@@ -1,0 +1,10 @@
+# nx-menu — one item per line: name<TAB>target<TAB>icon
+# The first 10 lines get keys 1..9 and 0. Below that, arrow keys or type to filter.
+# The target is usually a .desktop path, but any shell command works.
+# Manage this file with: nx-menu add <app> / nx-menu rm <name|number>
+Files	/usr/share/applications/org.gnome.Nautilus.desktop	org.gnome.Nautilus
+Terminal	/usr/share/applications/org.gnome.Terminal.desktop	org.gnome.Terminal
+Firefox	/usr/share/applications/firefox.desktop	firefox
+Text Editor	/usr/share/applications/org.gnome.TextEditor.desktop	org.gnome.TextEditor
+Calculator	/usr/share/applications/org.gnome.Calculator.desktop	org.gnome.Calculator
+Settings	/usr/share/applications/gnome-control-center.desktop	preferences-system

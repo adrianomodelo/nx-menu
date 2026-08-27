@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# nx-menu — a small fixed app launcher for GNOME on X11, on top of rofi
+#
+#   nx-menu              open the menu (this is what the shortcut calls)
+#   nx-menu add <term>   find an app and append it to the menu
+#   nx-menu rm <term|N>  remove by name or by position
+#   nx-menu list         show the items and which key launches each one
+#   nx-menu edit         open the item list in $EDITOR
+#
+# Items live in ~/.config/nx-menu/apps.tsv (name <TAB> target <TAB> icon).
+# The first 10 lines get keys 1..9 and 0; past that, arrow keys or typing.
+#
+# Inline comments are in Portuguese, the author's language. The behaviour they
+# describe is explained in English in the README.
+set -uo pipefail
+
+CONF="${NX_MENU_CONF:-$HOME/.config/nx-menu/apps.tsv}"
+LOG="${NX_MENU_LOG:-$HOME/.cache/nx-menu.log}"
+
+APP_DIRS=(
+  "$HOME/.local/share/applications"
+  "/var/lib/snapd/desktop/applications"
+  "/usr/share/applications"
+  "/usr/local/share/applications"
+  "/var/lib/flatpak/exports/share/applications"
+  "$HOME/.local/share/flatpak/exports/share/applications"
+)
+
+die() {
+  printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$1" >> "$LOG" 2>/dev/null
+  command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ] && notify-send "nx-menu" "$1"
+  echo "nx-menu: $1" >&2
+  exit 1
+}
+
+field() { grep -m1 "^$1=" "$2" 2>/dev/null | cut -d= -f2-; }
+
+# Idêntica à do nx-menu-sync de propósito: cada script se vira sozinho, sem
+# arquivo de biblioteca no meio. Se mudar aqui, mudar lá.
+# O Icon= do .desktop costuma ser NOME de tema, e o rofi só resolve nomes que
+# existam no tema do sistema; app de flatpak instala o ícone fora do tema.
+resolve_icon() {
+  local icon="$1" base hit
+  [ -z "$icon" ] && return 0
+  case "$icon" in /*) printf '%s\n' "$icon"; return 0 ;; esac
+  for base in \
+    "$HOME/.local/share/flatpak/exports/share/icons" \
+    /var/lib/flatpak/exports/share/icons \
+    "$HOME/.local/share/icons" \
+    /usr/share/icons \
+    /usr/share/pixmaps
+  do
+    [ -d "$base" ] || continue
+    hit=$(find "$base" -name "$icon.svg" -o -name "$icon.png" 2>/dev/null | sort -t/ -k6 -rn | head -1)
+    [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+  done
+  hit=$(find "$HOME/.local/share/flatpak/app" /var/lib/flatpak/app \
+          \( -name "$icon.svg" -o -name "$icon.png" \) 2>/dev/null | head -1)
+  [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+  printf '%s\n' "$icon"
+}
+
+load_items() {
+  names=(); targets=(); icons=()
+  [ -r "$CONF" ] || return 0
+  local name target icon
+  while IFS=$'\t' read -r name target icon || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    case "$name" in \#*) continue ;; esac
+    names+=("$name"); targets+=("${target:-}"); icons+=("${icon:-}")
+  done < "$CONF"
+}
+
+# Tecla que a posição i (0-based) recebe. Vazio da 11ª em diante.
+key_for() {
+  local i="$1"
+  if   [ "$i" -lt 9 ]; then echo "$((i + 1))"
+  elif [ "$i" -eq 9 ]; then echo "0"
+  else echo ""; fi
+}
+
+backup_conf() {
+  [ -f "$CONF" ] || return 0
+  local b="$CONF.bak-$(date +%Y%m%d-%H%M%S)"
+  cp "$CONF" "$b"
+  echo "backup: $b"
+}
+
+# Reescreve o TSV inteiro a partir dos arrays em memória, preservando o cabeçalho.
+write_items() {
+  local tmp="$CONF.tmp-$$"
+  {
+    printf '# nx-menu — one item per line: name<TAB>path.desktop (or command)<TAB>icon\n'
+    printf '# The first 10 lines become keys 1..9 and 0. Manage with "nx-menu add/rm".\n'
+    local i
+    for i in "${!names[@]}"; do
+      printf '%s\t%s\t%s\n' "${names[$i]}" "${targets[$i]}" "${icons[$i]}"
+    done
+  } > "$tmp"
+  mv "$tmp" "$CONF"
+}
+
+cmd_list() {
+  load_items
+  [ "${#names[@]}" -gt 0 ] || { echo "nx-menu: no items in $CONF"; return 0; }
+  echo "items in $CONF:"
+  local i k
+  for i in "${!names[@]}"; do
+    k=$(key_for "$i")
+    printf '  %2d) [%s] %-26s %s\n' "$((i + 1))" "${k:- }" "${names[$i]}" "${targets[$i]}"
+  done
+  echo
+  echo '  [n] = key that launches the item. No key: use arrows or type to filter.'
+}
+
+# Procura .desktop por termo, casando contra Name= e contra o nome do arquivo.
+# Ignora entradas escondidas (NoDisplay/Hidden) para não poluir o resultado.
+search_apps() {
+  local termo="$1" d f name nodisplay hidden type
+  for d in "${APP_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.desktop; do
+      [ -f "$f" ] || continue
+      type=$(field Type "$f")
+      [ "$type" = "Application" ] || [ -z "$type" ] || continue
+      nodisplay=$(field NoDisplay "$f"); hidden=$(field Hidden "$f")
+      [ "$nodisplay" = "true" ] && continue
+      [ "$hidden" = "true" ] && continue
+      name=$(field Name "$f")
+      [ -z "$name" ] && name=$(basename "$f" .desktop)
+      # Compara também uma versão sem separadores: procurar por "gnome-calculator"
+      # (o nome do pacote, que é o instinto de quem instalou) precisa achar o
+      # "org.gnome.Calculator.desktop" cujo Name= é só "Calculator".
+      local alvo_norm termo_norm
+      alvo_norm=$(printf '%s %s' "$name" "$(basename "$f")" | tr '[:upper:]' '[:lower:]' | tr -d '._ -')
+      termo_norm=$(printf '%s' "$termo" | tr '[:upper:]' '[:lower:]' | tr -d '._ -')
+      if printf '%s\n%s' "$name" "$(basename "$f")" | grep -qi -- "$termo" \
+         || { [ -n "$termo_norm" ] && case "$alvo_norm" in *"$termo_norm"*) true ;; *) false ;; esac; }; then
+        printf '%s\t%s\n' "$f" "$name"
+      fi
+    done
+  done | sort -u -t$'\t' -k1,1
+}
+
+cmd_add() {
+  local termo="${1:-}" pos=""
+  [ -n "$termo" ] || die "usage: nx-menu add <app name> [--pos N]"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pos) pos="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local path name
+  if [ -f "$termo" ] && case "$termo" in *.desktop) true ;; *) false ;; esac; then
+    path="$termo"; name=$(field Name "$path")
+  else
+    local hits; hits=$(search_apps "$termo")
+    local n; n=$(printf '%s' "$hits" | grep -c . || true)
+    [ "$n" -eq 0 ] && die "no app found for '$termo'"
+    if [ "$n" -eq 1 ]; then
+      path=$(printf '%s' "$hits" | cut -f1)
+      name=$(printf '%s' "$hits" | cut -f2)
+    else
+      if [ ! -t 0 ]; then
+        echo "nx-menu: '$termo' matched $n apps; pick one and pass its path:" >&2
+        printf '%s\n' "$hits" | awk -F'\t' '{printf "  %s  (%s)\n", $2, $1}' >&2
+        exit 1
+      fi
+      echo "'$termo' matched $n apps:"
+      printf '%s\n' "$hits" | awk -F'\t' '{printf "  %d) %-28s %s\n", NR, $2, $1}'
+      printf 'number (Enter cancels): '
+      local esc; read -r esc
+      [ -z "$esc" ] && { echo "cancelled"; exit 0; }
+      path=$(printf '%s\n' "$hits" | sed -n "${esc}p" | cut -f1)
+      name=$(printf '%s\n' "$hits" | sed -n "${esc}p" | cut -f2)
+      [ -n "$path" ] || die "invalid choice"
+    fi
+  fi
+
+  [ -n "$name" ] || name=$(basename "$path" .desktop)
+  local icon; icon=$(resolve_icon "$(field Icon "$path")")
+
+  load_items
+  local i
+  for i in "${!targets[@]}"; do
+    [ "${targets[$i]}" = "$path" ] && die "'$name' is already in the menu (position $((i + 1)))"
+  done
+
+  backup_conf
+  if [ -n "$pos" ] && [ "$pos" -ge 1 ] 2>/dev/null && [ "$pos" -le "${#names[@]}" ]; then
+    local idx=$((pos - 1))
+    names=("${names[@]:0:$idx}" "$name" "${names[@]:$idx}")
+    targets=("${targets[@]:0:$idx}" "$path" "${targets[@]:$idx}")
+    icons=("${icons[@]:0:$idx}" "$icon" "${icons[@]:$idx}")
+  else
+    names+=("$name"); targets+=("$path"); icons+=("$icon")
+  fi
+  write_items
+  echo "added: $name"
+  cmd_list
+}
+
+cmd_rm() {
+  local alvo="${1:-}"
+  [ -n "$alvo" ] || die "usage: nx-menu rm <name or number>"
+  load_items
+  [ "${#names[@]}" -gt 0 ] || die "menu is empty"
+
+  local idx=-1 i
+  if printf '%s' "$alvo" | grep -qE '^[0-9]+$' && [ "$alvo" -ge 1 ] && [ "$alvo" -le "${#names[@]}" ]; then
+    idx=$((alvo - 1))
+  else
+    local achados=()
+    for i in "${!names[@]}"; do
+      printf '%s' "${names[$i]}" | grep -qi -- "$alvo" && achados+=("$i")
+    done
+    [ "${#achados[@]}" -eq 0 ] && die "no menu item matches '$alvo'"
+    if [ "${#achados[@]}" -gt 1 ]; then
+      echo "nx-menu: '$alvo' matches more than one item, use the number:" >&2
+      for i in "${achados[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${names[$i]}" >&2; done
+      exit 1
+    fi
+    idx="${achados[0]}"
+  fi
+
+  local removido="${names[$idx]}"
+  backup_conf
+  unset 'names[idx]' 'targets[idx]' 'icons[idx]'
+  names=("${names[@]}"); targets=("${targets[@]}"); icons=("${icons[@]}")
+  write_items
+  echo "removed: $removido"
+  cmd_list
+}
+
+cmd_menu() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  printf '[%s] invoked DISPLAY=%s XAUTHORITY=%s\n' \
+    "$(date '+%F %T')" "${DISPLAY:-<vazio>}" "${XAUTHORITY:-<vazio>}" >> "$LOG" 2>/dev/null
+
+  [ -r "$CONF" ] || die "item list not found: $CONF (run nx-menu-sync)"
+  command -v rofi >/dev/null 2>&1 || die "rofi is not installed"
+
+  load_items
+  local total=${#names[@]}
+  [ "$total" -gt 0 ] || die "no valid items in $CONF"
+
+  local list="" i k entry
+  for i in "${!names[@]}"; do
+    k=$(key_for "$i")
+    if [ -n "$k" ]; then entry="$k  ${names[$i]}"; else entry="   ${names[$i]}"; fi
+    if [ -n "${icons[$i]}" ]; then
+      list+="${entry}\0icon\x1f${icons[$i]}\n"
+    else
+      list+="${entry}\n"
+    fi
+  done
+
+  # Tamanho da janela. Mexer aqui é seguro: é só aparência, e o rofi reclama
+  # em stderr se a sintaxe do tema quebrar (o script então falha alto, não calado).
+  local theme='
+    window   { width: 620px; location: center; anchor: center; border-radius: 18px; padding: 16px; }
+    listview { lines: 12; scrollbar: false; spacing: 3px; }
+    element  { padding: 12px 16px; border-radius: 12px; }
+    element-icon { size: 34px; }
+    element-text { vertical-align: 0.5; }
+    inputbar { padding: 8px 16px; margin: 0 0 10px 0; }
+    prompt   { enabled: false; }
+    * { font: "Ubuntu 13"; }
+  '
+
+  local args=(-dmenu -i -format i -no-custom -show-icons -p "" -theme-str "$theme")
+  local digits=(1 2 3 4 5 6 7 8 9 0) n
+  for n in "${!digits[@]}"; do
+    args+=("-kb-custom-$((n + 1))" "${digits[$n]}")
+  done
+
+  local err; err=$(mktemp -t nx-menu-err.XXXXXX)
+  trap 'rm -f "$err"' EXIT
+
+  local selected rc
+  selected=$(printf '%b' "$list" | rofi "${args[@]}" 2>"$err")
+  rc=$?
+
+  local idx=""
+  if [ "$rc" -eq 0 ]; then
+    idx="$selected"
+  elif [ "$rc" -ge 10 ] && [ "$rc" -le 19 ]; then
+    idx=$((rc - 10))
+  else
+    # Esc e falha real chegam aqui juntos, e o rofi ainda escreve WARNING benigno
+    # (ícone que não resolve). Tratar stderr não-vazio como erro já derrubou o
+    # menu por causa de um ícone, então o gatilho é a assinatura de erro FATAL.
+    if grep -qEi 'Failed to open display|Connection has error|cannot open display|Error while parsing|Failed to parse' "$err"; then
+      die "rofi failed (exit $rc): $(grep -Ei 'Failed to open display|Connection has error|cannot open display|Error while parsing|Failed to parse' "$err" | head -c 300 | tr '\n' ' ')"
+    fi
+    exit 0
+  fi
+
+  case "$idx" in ''|*[!0-9]*) exit 0 ;; esac
+  [ "$idx" -lt "$total" ] || exit 0
+
+  local target="${targets[$idx]}"
+  [ -n "$target" ] || die "item '${names[$idx]}' has no target"
+
+  case "$target" in
+    *.desktop)
+      [ -r "$target" ] || die "the .desktop file is gone: $target"
+      setsid gio launch "$target" >/dev/null 2>&1 &
+      ;;
+    *)
+      setsid bash -c "$target" >/dev/null 2>&1 &
+      ;;
+  esac
+  exit 0
+}
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  add)            shift; cmd_add "$@" ;;
+  rm|remove|del)  shift; cmd_rm "$@" ;;
+  list|ls)        cmd_list ;;
+  edit)           "${EDITOR:-gnome-text-editor}" "$CONF" ;;
+  help|-h|--help) usage ;;
+  "")             cmd_menu ;;
+  *)              usage; exit 1 ;;
+esac

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# nx-menu-sync — gera ~/.config/nx-menu/apps.tsv a partir dos apps fixados no dock do GNOME
+#
+# Resolve cada entrada de org.gnome.shell favorite-apps até o .desktop real
+# (local, snap, flatpak ou sistema) e escreve nome, caminho e ícone.
+# Rodar de novo sobrescreve o arquivo, então edite o TSV só depois de sincronizar.
+set -uo pipefail
+
+CONF_DIR="${NX_MENU_DIR:-$HOME/.config/nx-menu}"
+CONF="$CONF_DIR/apps.tsv"
+
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+SEARCH_DIRS=(
+  "$HOME/.local/share/applications"
+  "/var/lib/snapd/desktop/applications"
+  "/usr/share/applications"
+  "/usr/local/share/applications"
+  "/var/lib/flatpak/exports/share/applications"
+  "$HOME/.local/share/flatpak/exports/share/applications"
+)
+
+find_desktop() {
+  local id="$1" d
+  for d in "${SEARCH_DIRS[@]}"; do
+    [ -f "$d/$id" ] && { printf '%s\n' "$d/$id"; return 0; }
+  done
+  # Flatpak instalado por usuário nem sempre exporta: procura na árvore do app.
+  local hit
+  hit=$(find "$HOME/.local/share/flatpak/app" /var/lib/flatpak/app \
+          -name "$id" -path "*/files/share/applications/*" 2>/dev/null | head -1)
+  [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+  return 1
+}
+
+field() { grep -m1 "^$1=" "$2" 2>/dev/null | cut -d= -f2-; }
+
+# O Icon= do .desktop costuma ser um NOME de tema, e o rofi só resolve nomes que
+# existam no tema do sistema. App de flatpak instala o ícone na árvore dele, fora
+# do tema, e o rofi então avisa que não achou. Aqui a gente resolve o nome para
+# caminho absoluto quando conseguir; se não achar, devolve o nome cru e o rofi
+# tenta o tema como antes.
+resolve_icon() {
+  local icon="$1"
+  [ -z "$icon" ] && return 0
+  case "$icon" in /*) printf '%s\n' "$icon"; return 0 ;; esac
+
+  local base hit
+  for base in \
+    "$HOME/.local/share/flatpak/exports/share/icons" \
+    /var/lib/flatpak/exports/share/icons \
+    "$HOME/.local/share/icons" \
+    /usr/share/icons \
+    /usr/share/pixmaps
+  do
+    [ -d "$base" ] || continue
+    # Prefere o maior tamanho disponível, e SVG quando houver.
+    hit=$(find "$base" -name "$icon.svg" -o -name "$icon.png" 2>/dev/null \
+          | sort -t/ -k6 -rn | head -1)
+    [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+  done
+
+  # Último recurso: dentro da árvore do próprio flatpak, que não exporta ícone.
+  hit=$(find "$HOME/.local/share/flatpak/app" /var/lib/flatpak/app \
+          \( -name "$icon.svg" -o -name "$icon.png" \) 2>/dev/null | head -1)
+  [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+
+  printf '%s\n' "$icon"
+}
+
+mkdir -p "$CONF_DIR"
+
+# Este comando SOBRESCREVE a lista inteira, então qualquer item acrescentado à
+# mão (ou por "nx-menu add") desaparece. Backup antes, sempre: perder a curadoria
+# do menu por rodar um sync distraído seria um jeito bobo de estragar a tarde.
+if [ -f "$CONF" ]; then
+  bkp="$CONF.bak-$(date +%Y%m%d-%H%M%S)"
+  cp "$CONF" "$bkp"
+  echo "nx-menu-sync: backup do arquivo atual em $bkp"
+fi
+
+tmp="$CONF.tmp-$$"
+
+{
+  printf '# nx-menu — um item por linha: nome<TAB>caminho.desktop (ou comando)<TAB>ícone\n'
+  printf '# Gerado por nx-menu-sync a partir do dock do GNOME em %s\n' "$(date '+%d/%m/%Y %H:%M')"
+  printf '# Reordene à vontade: as 10 primeiras linhas viram as teclas 1..9 e 0.\n'
+} > "$tmp"
+
+count=0
+missing=0
+while read -r id; do
+  [ -z "$id" ] && continue
+  if path=$(find_desktop "$id"); then
+    name=$(field Name "$path")
+    icon=$(resolve_icon "$(field Icon "$path")")
+    [ -z "$name" ] && name="$id"
+    printf '%s\t%s\t%s\n' "$name" "$path" "$icon" >> "$tmp"
+    count=$((count + 1))
+  else
+    printf '# NAO RESOLVIDO: %s\n' "$id" >> "$tmp"
+    missing=$((missing + 1))
+  fi
+done < <(gsettings get org.gnome.shell favorite-apps | tr -d "[]'," | tr ' ' '\n')
+
+mv "$tmp" "$CONF"
+
+echo "nx-menu-sync: $count itens em $CONF"
+[ "$missing" -gt 0 ] && echo "nx-menu-sync: $missing entrada(s) não resolvida(s), comentadas no arquivo" >&2
+exit 0
