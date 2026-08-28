@@ -45,6 +45,22 @@ nx-menu rm 5                  # or by position
 nx-menu edit                  # open the list in $EDITOR to reorder in bulk
 ```
 
+### Already running? It raises, it does not duplicate
+
+Picking an app that already has a window brings that window to the front instead
+of starting a second instance. It finds the window through the `.desktop` file's
+`StartupWMClass`, which is the field that exists precisely to link a launcher
+entry to its window, and raises it with `wmctrl`. `gio launch` alone has no idea
+the app is running and would happily open another copy.
+
+When you *want* a second instance (a terminal, usually), mark the item:
+
+```bash
+nx-menu add kitty --new
+```
+
+That writes a fourth `new` column in the TSV. Items without it are raised.
+
 `add` searches every standard `.desktop` location (user, system, snap, flatpak),
 skips hidden entries, resolves the icon to an absolute path, and refuses
 duplicates. It matches on the display name, the filename, and a normalized form,
@@ -54,7 +70,7 @@ so searching for `gnome-calculator` finds `org.gnome.Calculator.desktop` whose
 Items live in `~/.config/nx-menu/apps.tsv`, one per line, **tab separated**:
 
 ```
-Name shown	/path/to/app.desktop	icon
+Name shown	/path/to/app.desktop	icon	[new]
 ```
 
 The target can also be a plain shell command. `nx-menu-sync` regenerates the file
@@ -107,7 +123,7 @@ otherwise look identical:
 
 ## Requirements
 
-GNOME on **X11**, `rofi` 1.7+, `bash`. Wayland is not supported: GNOME does not
+GNOME on **X11**, `rofi` 1.7+, `wmctrl`, `bash`. Wayland is not supported: GNOME does not
 allow the kind of override rofi needs there. If you are on Wayland, use walker,
 wofi, or fuzzel.
 

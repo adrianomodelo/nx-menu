@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # nx-menu — a small fixed app launcher for GNOME on X11, on top of rofi
 #
-#   nx-menu              open the menu (this is what the shortcut calls)
-#   nx-menu add <term>   find an app and append it to the menu
-#   nx-menu rm <term|N>  remove by name or by position
-#   nx-menu list         show the items and which key launches each one
-#   nx-menu edit         open the item list in $EDITOR
+#   nx-menu               open the menu (this is what the shortcut calls)
+#   nx-menu add <term>    find an app and append it to the menu (--new, --pos N)
+#   nx-menu rm <term|N>   remove by name or by position
+#   nx-menu list          show the items and which key launches each one
+#   nx-menu edit          open the item list in $EDITOR
 #
-# Items live in ~/.config/nx-menu/apps.tsv (name <TAB> target <TAB> icon).
+# Items live in ~/.config/nx-menu/apps.tsv (name <TAB> target <TAB> icon <TAB> flag).
 # The first 10 lines get keys 1..9 and 0; past that, arrow keys or typing.
+# An already-running app is raised instead of launched again; flag "new" opts out.
 #
 # Inline comments are in Portuguese, the author's language. The behaviour they
 # describe is explained in English in the README.
@@ -61,14 +62,42 @@ resolve_icon() {
 }
 
 load_items() {
-  names=(); targets=(); icons=()
+  names=(); targets=(); icons=(); flags=()
   [ -r "$CONF" ] || return 0
-  local name target icon
-  while IFS=$'\t' read -r name target icon || [ -n "${name:-}" ]; do
+  local name target icon flag
+  while IFS=$'\t' read -r name target icon flag || [ -n "${name:-}" ]; do
     [ -z "${name:-}" ] && continue
     case "$name" in \#*) continue ;; esac
-    names+=("$name"); targets+=("${target:-}"); icons+=("${icon:-}")
+    names+=("$name"); targets+=("${target:-}"); icons+=("${icon:-}"); flags+=("${flag:-}")
   done < "$CONF"
+}
+
+# Traz para a frente a janela que já existe, em vez de abrir outra instância.
+# Devolve 0 se focou alguma, 1 se não achou (e aí o chamador lança normalmente).
+#
+# A pista é o StartupWMClass= do .desktop, que é justamente o campo criado para
+# ligar o lançador à janela: um PWA do Chrome, por exemplo, roda dentro do
+# processo do Chrome e só se identifica por essa classe (crx_<id>).
+focus_existing() {
+  local desktop="$1"
+  command -v wmctrl >/dev/null 2>&1 || return 1
+
+  local cls; cls=$(field StartupWMClass "$desktop")
+  if [ -z "$cls" ]; then
+    # Sem o campo, tenta o binário do Exec (kitty, discord, remmina...).
+    cls=$(basename "$(field Exec "$desktop" | awk '{print $1}')")
+  fi
+  [ -n "$cls" ] || return 1
+
+  local alvo="${cls,,}" id desk wmcls inst klass
+  while read -r id desk wmcls _; do
+    [ -n "${wmcls:-}" ] || continue
+    inst="${wmcls%%.*}"; klass="${wmcls#*.}"
+    if [ "${inst,,}" = "$alvo" ] || [ "${klass,,}" = "$alvo" ]; then
+      wmctrl -ia "$id" 2>/dev/null && return 0
+    fi
+  done < <(wmctrl -lx 2>/dev/null)
+  return 1
 }
 
 # Tecla que a posição i (0-based) recebe. Vazio da 11ª em diante.
@@ -90,11 +119,12 @@ backup_conf() {
 write_items() {
   local tmp="$CONF.tmp-$$"
   {
-    printf '# nx-menu — one item per line: name<TAB>path.desktop (or command)<TAB>icon\n'
+    printf '# nx-menu — one item per line: name<TAB>path.desktop (or command)<TAB>icon<TAB>flag\n'
     printf '# The first 10 lines become keys 1..9 and 0. Manage with "nx-menu add/rm".\n'
+    printf '# flag "new" = always open a new instance; empty = raise the existing window.\n'
     local i
     for i in "${!names[@]}"; do
-      printf '%s\t%s\t%s\n' "${names[$i]}" "${targets[$i]}" "${icons[$i]}"
+      printf '%s\t%s\t%s\t%s\n' "${names[$i]}" "${targets[$i]}" "${icons[$i]}" "${flags[$i]:-}"
     done
   } > "$tmp"
   mv "$tmp" "$CONF"
@@ -143,12 +173,13 @@ search_apps() {
 }
 
 cmd_add() {
-  local termo="${1:-}" pos=""
-  [ -n "$termo" ] || die "usage: nx-menu add <app name> [--pos N]"
+  local termo="${1:-}" pos="" flag=""
+  [ -n "$termo" ] || die "usage: nx-menu add <app name> [--pos N] [--new]"
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
       --pos) pos="${2:-}"; shift 2 ;;
+      --new) flag="new"; shift ;;
       *) shift ;;
     esac
   done
@@ -195,8 +226,9 @@ cmd_add() {
     names=("${names[@]:0:$idx}" "$name" "${names[@]:$idx}")
     targets=("${targets[@]:0:$idx}" "$path" "${targets[@]:$idx}")
     icons=("${icons[@]:0:$idx}" "$icon" "${icons[@]:$idx}")
+    flags=("${flags[@]:0:$idx}" "$flag" "${flags[@]:$idx}")
   else
-    names+=("$name"); targets+=("$path"); icons+=("$icon")
+    names+=("$name"); targets+=("$path"); icons+=("$icon"); flags+=("$flag")
   fi
   write_items
   echo "added: $name"
@@ -228,8 +260,8 @@ cmd_rm() {
 
   local removido="${names[$idx]}"
   backup_conf
-  unset 'names[idx]' 'targets[idx]' 'icons[idx]'
-  names=("${names[@]}"); targets=("${targets[@]}"); icons=("${icons[@]}")
+  unset 'names[idx]' 'targets[idx]' 'icons[idx]' 'flags[idx]'
+  names=("${names[@]}"); targets=("${targets[@]}"); icons=("${icons[@]}"); flags=("${flags[@]}")
   write_items
   echo "removed: $removido"
   cmd_list
@@ -308,6 +340,10 @@ cmd_menu() {
   case "$target" in
     *.desktop)
       [ -r "$target" ] || die "the .desktop file is gone: $target"
+      # Já aberto? Levanta a janela. `gio launch` não sabe disso e duplicaria.
+      if [ "${flags[$idx]:-}" != "new" ] && focus_existing "$target"; then
+        exit 0
+      fi
       setsid gio launch "$target" >/dev/null 2>&1 &
       ;;
     *)

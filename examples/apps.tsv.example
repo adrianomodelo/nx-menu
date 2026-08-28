@@ -3,7 +3,7 @@
 # The target is usually a .desktop path, but any shell command works.
 # Manage this file with: nx-menu add <app> / nx-menu rm <name|number>
 Files	/usr/share/applications/org.gnome.Nautilus.desktop	org.gnome.Nautilus
-Terminal	/usr/share/applications/org.gnome.Terminal.desktop	org.gnome.Terminal
+Terminal	/usr/share/applications/org.gnome.Terminal.desktop	org.gnome.Terminal	new
 Firefox	/usr/share/applications/firefox.desktop	firefox
 Text Editor	/usr/share/applications/org.gnome.TextEditor.desktop	org.gnome.TextEditor
 Calculator	/usr/share/applications/org.gnome.Calculator.desktop	org.gnome.Calculator
