@@ -17,7 +17,7 @@ promising features, releases, or support.
 ## Install
 
 ```bash
-sudo apt install rofi          # or your distro's equivalent
+sudo apt install rofi wmctrl   # or your distro's equivalent
 git clone https://github.com/<you>/nx-menu && cd nx-menu
 ./install.sh                   # binds Super+Q; pass another key to override
 ```

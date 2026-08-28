@@ -13,10 +13,12 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
 
-command -v rofi >/dev/null 2>&1 || {
-  echo "rofi is required. On Debian/Ubuntu: sudo apt install rofi" >&2
-  exit 1
-}
+for dep in rofi wmctrl; do
+  command -v "$dep" >/dev/null 2>&1 || {
+    echo "$dep is required. On Debian/Ubuntu: sudo apt install rofi wmctrl" >&2
+    exit 1
+  }
+done
 
 mkdir -p "$BIN"
 install -m 0755 "$SRC/nx-menu" "$SRC/nx-menu-sync" "$SRC/reset-keybinds.sh" "$BIN/"
