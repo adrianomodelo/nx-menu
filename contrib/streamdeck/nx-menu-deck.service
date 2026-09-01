@@ -1,0 +1,15 @@
+[Unit]
+Description=Mirror the nx-menu launcher on an Elgato Stream Deck MK.2
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nx-menu-deck
+Environment=NX_MENU_CONF=%h/.config/nx-menu/apps.tsv
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%h/.cache/nx-menu-deck.log
+StandardError=append:%h/.cache/nx-menu-deck.log
+
+[Install]
+WantedBy=default.target

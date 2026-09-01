@@ -43,7 +43,14 @@ nx-menu add spotify --pos 3   # insert at position 3, pushing the rest down
 nx-menu rm spotify            # remove by name
 nx-menu rm 5                  # or by position
 nx-menu edit                  # open the list in $EDITOR to reorder in bulk
+nx-menu launch 3              # launch item 3 directly, bypassing rofi
 ```
+
+`launch` takes the same 1-based number `nx-menu list` prints and exits non-zero
+on anything invalid (missing, non-numeric, 0, negative, or past the last item),
+so a caller can tell success from failure. It exists for things that are not
+rofi: see [`contrib/streamdeck`](contrib/streamdeck) for a Stream Deck that
+mirrors this same menu and calls `nx-menu launch <N>` on every keypress.
 
 ### Already running? It raises, it does not duplicate
 

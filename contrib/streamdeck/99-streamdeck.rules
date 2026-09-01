@@ -1,0 +1,6 @@
+# Elgato Stream Deck — let a regular (non-root) user open the device.
+# idVendor 0fd9 is Elgato; idProduct 0080 is the Stream Deck MK.2.
+# Drop this in /etc/udev/rules.d/ and reload:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0080", MODE="0666", GROUP="plugdev"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0080", MODE="0666", GROUP="plugdev"

@@ -5,6 +5,7 @@
 #   nx-menu add <term>    find an app and append it to the menu (--new, --pos N)
 #   nx-menu rm <term|N>   remove by name or by position
 #   nx-menu list          show the items and which key launches each one
+#   nx-menu launch <N>    launch item N directly, N is 1-based (same numbering as list)
 #   nx-menu edit          open the item list in $EDITOR
 #
 # Items live in ~/.config/nx-menu/apps.tsv (name <TAB> target <TAB> icon <TAB> flag).
@@ -106,6 +107,30 @@ key_for() {
   if   [ "$i" -lt 9 ]; then echo "$((i + 1))"
   elif [ "$i" -eq 9 ]; then echo "0"
   else echo ""; fi
+}
+
+# Lança (ou levanta a janela existente) o item na posição idx (0-based, como
+# os arrays internos). Compartilhada por cmd_menu (rofi) e cmd_launch
+# (Stream Deck e qualquer outro chamador externo), para não duplicar a
+# semântica de raise-vs-launch em dois lugares.
+launch_item() {
+  local idx="$1"
+  local target="${targets[$idx]}"
+  [ -n "$target" ] || die "item '${names[$idx]}' has no target"
+
+  case "$target" in
+    *.desktop)
+      [ -r "$target" ] || die "the .desktop file is gone: $target"
+      # Já aberto? Levanta a janela. `gio launch` não sabe disso e duplicaria.
+      if [ "${flags[$idx]:-}" != "new" ] && focus_existing "$target"; then
+        return 0
+      fi
+      setsid gio launch "$target" >/dev/null 2>&1 &
+      ;;
+    *)
+      setsid bash -c "$target" >/dev/null 2>&1 &
+      ;;
+  esac
 }
 
 backup_conf() {
@@ -334,33 +359,42 @@ cmd_menu() {
   case "$idx" in ''|*[!0-9]*) exit 0 ;; esac
   [ "$idx" -lt "$total" ] || exit 0
 
-  local target="${targets[$idx]}"
-  [ -n "$target" ] || die "item '${names[$idx]}' has no target"
-
-  case "$target" in
-    *.desktop)
-      [ -r "$target" ] || die "the .desktop file is gone: $target"
-      # Já aberto? Levanta a janela. `gio launch` não sabe disso e duplicaria.
-      if [ "${flags[$idx]:-}" != "new" ] && focus_existing "$target"; then
-        exit 0
-      fi
-      setsid gio launch "$target" >/dev/null 2>&1 &
-      ;;
-    *)
-      setsid bash -c "$target" >/dev/null 2>&1 &
-      ;;
-  esac
+  launch_item "$idx"
   exit 0
 }
 
+# nx-menu launch <N> — N é 1-based (a mesma numeração que "nx-menu list"
+# imprime), pensado para chamadores externos como o Stream Deck que não
+# passam pelo rofi. Precisa distinguir claramente sucesso de erro: quem
+# chama (um daemon, um botão físico) só tem o exit code para saber se
+# lançou ou não.
+cmd_launch() {
+  local n="${1:-}"
+  case "$n" in
+    ''|*[!0-9]*) die "usage: nx-menu launch <N> (N is 1-based, see 'nx-menu list')" ;;
+  esac
+
+  load_items
+  local total=${#names[@]}
+  [ "$total" -gt 0 ] || die "no valid items in $CONF"
+  [ "$n" -ge 1 ] && [ "$n" -le "$total" ] || die "invalid item number: $n (menu has $total item(s), 1..$total)"
+
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  printf '[%s] launch %s (%s)\n' "$(date '+%F %T')" "$n" "${names[$((10#$n - 1))]}" >> "$LOG" 2>/dev/null
+
+  launch_item "$((10#$n - 1))"
+  return 0
+}
+
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
   add)            shift; cmd_add "$@" ;;
   rm|remove|del)  shift; cmd_rm "$@" ;;
   list|ls)        cmd_list ;;
+  launch)         shift; cmd_launch "$@" ;;
   edit)           "${EDITOR:-gnome-text-editor}" "$CONF" ;;
   help|-h|--help) usage ;;
   "")             cmd_menu ;;
