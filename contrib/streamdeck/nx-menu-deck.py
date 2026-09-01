@@ -36,6 +36,86 @@ POLL_SECONDS = 2.0  # how often the daemon checks apps.tsv's mtime.
 
 NX_MENU_BIN = os.environ.get("NX_MENU_BIN", "nx-menu")
 
+# Same search order as nx-menu-sync's resolve_icon(), minus the SVG branch —
+# by the time this runs, opening the item's own icon already failed, so this
+# only looks for a same-basename PNG. Kept in lockstep on purpose: the two
+# tools disagreeing about where an icon lives would be its own silent-drift
+# bug, the same class this file's docstring already warns about.
+_ICON_SEARCH_DIRS = [
+    Path.home() / ".local" / "share" / "flatpak" / "exports" / "share" / "icons",
+    Path("/var/lib/flatpak/exports/share/icons"),
+    Path.home() / ".local" / "share" / "icons",
+    Path("/usr/share/icons"),
+    Path("/usr/share/pixmaps"),
+]
+# Last resort, matching resolve_icon(): inside the flatpak app tree itself,
+# for apps that do not export an icon at all.
+_ICON_APP_TREE_DIRS = [
+    Path.home() / ".local" / "share" / "flatpak" / "app",
+    Path("/var/lib/flatpak/app"),
+]
+
+# The tree walk below is not cheap, and render_key_image() runs on every
+# reload — cache the answer per icon string so a broken icon only ever gets
+# looked up once.
+_icon_fallback_cache: "dict[str, Path | None]" = {}
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def _icon_size_key(path: Path) -> int:
+    """Rank a candidate PNG by the size implied by its directory name (e.g.
+    .../128x128/apps/foo.png), so the largest available one wins — matching
+    resolve_icon()'s "prefer the largest size" behaviour in nx-menu-sync.
+    """
+    for part in path.parts:
+        head, _, tail = part.partition("x")
+        if head.isdigit() and tail.isdigit():
+            return int(head)
+    return 0
+
+
+def find_icon_png_fallback(icon: str) -> "Path | None":
+    """Look for a same-basename .png in the places nx-menu-sync's
+    resolve_icon() already searches, in the same priority order — the
+    first search dir with any match wins (picking its largest size), and
+    the flatpak app tree is only checked once none of them have anything.
+    Only called after Pillow has already failed to open `icon` directly (an
+    SVG, most often — Pillow does not rasterize those). Never raises: any
+    lookup trouble here just means "no fallback, fall through to the
+    placeholder", not a crashed daemon.
+    """
+    if icon in _icon_fallback_cache:
+        return _icon_fallback_cache[icon]
+
+    stem = Path(icon).stem
+    result: "Path | None" = None
+    if stem:
+        try:
+            for base in _ICON_SEARCH_DIRS:
+                if not base.is_dir():
+                    continue
+                candidates = list(base.rglob(f"{stem}.png"))
+                if candidates:
+                    result = max(candidates, key=_icon_size_key)
+                    break
+            else:
+                for base in _ICON_APP_TREE_DIRS:
+                    if not base.is_dir():
+                        continue
+                    hit = next(base.rglob(f"{stem}.png"), None)
+                    if hit is not None:
+                        result = hit
+                        break
+        except OSError:
+            result = None
+
+    _icon_fallback_cache[icon] = result
+    return result
+
 
 def default_conf() -> Path:
     conf = os.environ.get("NX_MENU_CONF")
@@ -94,9 +174,11 @@ def build_key_mapping(items: list[MenuItem]) -> tuple[dict[int, MenuItem], int]:
 
 def render_key_image(item: "MenuItem | None"):
     """Draw one 72x72 key: the icon (if it loads) plus the name at the
-    bottom. A missing or unreadable icon (an SVG, say — Pillow does not
-    rasterize those) falls back to a plain placeholder with the name — a
-    bad icon on one item must never take the whole daemon down.
+    bottom. An icon Pillow can't open (an SVG, most often — Pillow does not
+    rasterize those) first tries a same-basename PNG via
+    find_icon_png_fallback(), then falls back to a plain placeholder with
+    the name — a bad icon on one item must never take the whole daemon
+    down.
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -117,6 +199,13 @@ def render_key_image(item: "MenuItem | None"):
             icon_img = Image.open(item.icon).convert("RGBA")
         except Exception:
             icon_img = None
+        if icon_img is None:
+            fallback = find_icon_png_fallback(item.icon)
+            if fallback is not None:
+                try:
+                    icon_img = Image.open(fallback).convert("RGBA")
+                except Exception:
+                    icon_img = None
 
     if icon_img is not None:
         area = int(size * 0.62)
@@ -171,13 +260,32 @@ def dry_run(conf_path: Path, out_dir: Path) -> None:
 # still run --dry-run to check the rendering and the mapping.
 # ---------------------------------------------------------------------------
 
+def launch_item(item: "MenuItem", key: int) -> None:
+    """Launch the app for one key press by running `nx-menu launch <N>` via
+    NX_MENU_BIN, logging both the attempt and any failure. Never raises: a
+    missing or broken NX_MENU_BIN must not take the callback thread — and
+    with it every other key — down with it. This is the exact failure the
+    published unit hit with a systemd --user PATH that lacks ~/.local/bin
+    (see README.md) — the deck looked perfect and did nothing on every
+    press, silently. Kept as a module-level function (not inlined in
+    run_device()'s on_key_change closure) so selftest.sh can exercise it
+    without a real Stream Deck attached.
+    """
+    cmd = [NX_MENU_BIN, "launch", str(key + 1)]
+    log(f"key {key} -> item {key + 1}: {item.name} ({' '.join(cmd)})")
+    try:
+        subprocess.Popen(cmd)
+    except Exception as exc:
+        log(f"failed to launch {cmd!r}: {exc}")
+
+
 def run_device(conf_path: Path) -> None:
     from StreamDeck.DeviceManager import DeviceManager
     from StreamDeck.ImageHelpers import PILHelper
 
     decks = DeviceManager().enumerate()
     if not decks:
-        print("nx-menu-deck: no Stream Deck device found", file=sys.stderr)
+        log("no Stream Deck device found")
         sys.exit(1)
 
     deck = decks[0]
@@ -195,8 +303,18 @@ def run_device(conf_path: Path) -> None:
             # Without the retry, the deck sometimes lights up with the
             # brightness call silently not applied — symptom: "the deck is
             # off", no error anywhere.
-            print(f"nx-menu-deck: set_brightness attempt {attempt + 1}: {exc}", file=sys.stderr)
+            log(f"set_brightness attempt {attempt + 1}: {exc}")
             time.sleep(0.3)
+
+    try:
+        model = deck.deck_type()
+    except Exception as exc:
+        model = f"unknown ({exc})"
+    try:
+        serial = deck.get_serial_number()
+    except Exception as exc:
+        serial = f"unknown ({exc})"
+    log(f"device: {model} serial={serial} keys={KEY_COUNT} conf={conf_path}")
 
     state: dict = {"mtime": None, "mapping": {}}
 
@@ -211,16 +329,14 @@ def run_device(conf_path: Path) -> None:
         items = load_items(conf_path)
         mapping, overflow = build_key_mapping(items)
         if overflow:
-            print(
-                f"nx-menu-deck: {overflow} item(s) do not fit on {KEY_COUNT} keys "
-                "and were left out",
-                file=sys.stderr,
-            )
+            log(f"{overflow} item(s) do not fit on {KEY_COUNT} keys and were left out")
         state["mapping"] = mapping
         for key in range(KEY_COUNT):
             img = render_key_image(mapping.get(key))
             native = PILHelper.to_native_key_format(deck, img)
             deck.set_key_image(key, native)
+        verb = "reloaded" if not force else "loaded"
+        log(f"apps.tsv {verb}: {len(mapping)} item(s) mapped")
 
     def on_key_change(_deck, key, pressed):
         if not pressed:
@@ -228,7 +344,7 @@ def run_device(conf_path: Path) -> None:
         item = state["mapping"].get(key)
         if item is None:
             return
-        subprocess.Popen([NX_MENU_BIN, "launch", str(key + 1)])
+        launch_item(item, key)
 
     reload_if_changed(force=True)
     deck.set_key_callback(on_key_change)

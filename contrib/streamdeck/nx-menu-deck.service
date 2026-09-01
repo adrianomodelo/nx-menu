@@ -6,6 +6,10 @@ After=graphical-session.target
 Type=simple
 ExecStart=%h/.local/bin/nx-menu-deck
 Environment=NX_MENU_CONF=%h/.config/nx-menu/apps.tsv
+# The systemd --user PATH does not include ~/.local/bin, so without this the
+# deck comes up, renders every key correctly, and every press does nothing —
+# see README.md's "The service's PATH does not include ~/.local/bin".
+Environment=NX_MENU_BIN=%h/.local/bin/nx-menu
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:%h/.cache/nx-menu-deck.log

@@ -74,10 +74,25 @@ NX_MENU_CONF=/path/to/apps.tsv nx-menu-deck.py --dry-run --out /tmp/deck-preview
 
 ## Known limitations
 
-- **SVG icons are not rendered.** Pillow does not rasterize SVG. An item
-  whose icon is an `.svg` file falls back to the plain placeholder (a
-  bordered box with the name) instead of aborting — the same fallback used
-  for a missing or unreadable icon file of any kind.
+- **SVG icons are not rendered directly.** Pillow does not rasterize SVG. An
+  item whose icon is an `.svg` file (or any icon Pillow can't open) first
+  looks for a same-basename `.png` in the usual icon directories and the
+  flatpak app tree — the same places `nx-menu-sync`'s `resolve_icon()`
+  already searches — preferring the largest size found. Only when that also
+  turns up nothing does it fall back to the plain placeholder (a bordered
+  box with the name).
 - Only the first 15 items show up on the deck (3 rows x 5 columns). Items
-  past the 15th are left off, and the daemon prints how many to stderr
-  instead of truncating silently.
+  past the 15th are left off, and the daemon logs how many instead of
+  truncating silently.
+
+## The service's PATH does not include `~/.local/bin`
+
+The unit runs under systemd's **user manager**, whose `PATH` is a fixed
+system default — it does *not* include `~/.local/bin`, even though that's
+where step 1 above installs `nx-menu`. Without the `NX_MENU_BIN` override in
+`nx-menu-deck.service`, the daemon still starts, still finds the device,
+still renders every key with the right icon and name — and every press just
+does nothing, because `nx-menu` isn't on that `PATH` to be found. Nothing
+about that failure is visible without reading the log: it's a deck that
+looks completely correct and is completely mute. The service file pins
+`NX_MENU_BIN=%h/.local/bin/nx-menu` explicitly so this can't happen.
